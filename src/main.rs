@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, process, thread};
 
 const SCROLLBACK: usize = 5000;
 const QUEUE: usize = 4096;
+const MAX_REPLY: usize = 8000;
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -20,7 +21,7 @@ enum Req {
     Spawn { name: String, cwd: String, argv: Vec<String>, env: HashMap<String, String>, cols: u16, rows: u16 },
     List,
     Kill { name: String },
-    State { name: String, value: String },
+    State { name: String, value: String, #[serde(default)] reply: Option<String> },
     Attach { name: String },
 }
 
@@ -54,6 +55,8 @@ struct Term {
     clients: Vec<(u64, SyncSender<Vec<u8>>)>,
     primary: u64,
     state: String,
+    reply: String,
+    reply_at: u64,
 }
 
 struct Session {
@@ -158,6 +161,8 @@ fn spawn(server: &Arc<Server>, name: String, cwd: String, argv: Vec<String>, var
             clients: Vec::new(),
             primary: 0,
             state: String::new(),
+            reply: String::new(),
+            reply_at: 0,
         }),
     });
     if let Some(old) = server.sessions.lock().unwrap().insert(name.clone(), session.clone()) {
@@ -221,7 +226,7 @@ fn handle(req: Req, server: &Arc<Server>) -> Result<Value, String> {
                 .iter()
                 .map(|(name, s)| {
                     let term = s.term.lock().unwrap();
-                    json!({ "name": name, "pid": s.pid, "title": term.parser.callbacks().title, "state": term.state })
+                    json!({ "name": name, "pid": s.pid, "title": term.parser.callbacks().title, "state": term.state, "reply": term.reply, "replyAt": term.reply_at })
                 })
                 .collect();
             Ok(json!({ "ok": true, "sessions": list }))
@@ -232,10 +237,15 @@ fn handle(req: Req, server: &Arc<Server>) -> Result<Value, String> {
             }
             Ok(json!({ "ok": true }))
         }
-        Req::State { name, value } => {
+        Req::State { name, value, reply } => {
             let map = server.sessions.lock().unwrap();
             let s = map.get(&name).ok_or("no such session")?;
-            s.term.lock().unwrap().state = value;
+            let mut term = s.term.lock().unwrap();
+            term.state = value;
+            if let Some(reply) = reply {
+                term.reply = reply.chars().take(MAX_REPLY).collect();
+                term.reply_at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+            }
             Ok(json!({ "ok": true }))
         }
         Req::Attach { .. } => Err("attach needs a stream".into()),
@@ -387,7 +397,40 @@ fn request(info: &Path, mut req: Value) -> Result<Value, String> {
     }
 }
 
+fn hook_request(event: &str, payload: &Value) -> Option<Value> {
+    let state = match event {
+        "tool" => payload["tool_name"].as_str().map_or("busy".to_string(), |tool| format!("busy:{tool}")),
+        "reply" => "idle".to_string(),
+        "idle" | "busy" | "waiting" => event.to_string(),
+        _ => return None,
+    };
+    let mut req = json!({ "op": "state", "value": state });
+    if let Some(message) = payload["last_assistant_message"].as_str().filter(|_| event == "reply") {
+        req["reply"] = json!(message);
+    }
+    Some(req)
+}
+
+fn hook(event: &str) {
+    let (Ok(info), Ok(name)) = (env::var("LITEMUX"), env::var("LITEMUX_SESSION")) else { return };
+    let mut input = String::new();
+    if matches!(event, "tool" | "reply") {
+        let _ = std::io::stdin().read_to_string(&mut input);
+    }
+    let payload = serde_json::from_str(&input).unwrap_or(Value::Null);
+    if let Some(mut req) = hook_request(event, &payload) {
+        req["name"] = json!(name);
+        let _ = request(Path::new(&info), req);
+    }
+}
+
 fn run(mut args: Vec<String>) -> Result<(), String> {
+    if let [command, event] = args.as_slice() {
+        if command == "hook" {
+            hook(event);
+            return Ok(());
+        }
+    }
     let mut info = env::var("LITEMUX").ok();
     if args.first().map(String::as_str) == Some("-S") && args.len() > 1 {
         info = Some(args[1].clone());
@@ -407,7 +450,7 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         ["kill", name] => request(&info, json!({ "op": "kill", "name": name })).map(|_| ()),
-        _ => Err("usage: litemux [-S file] server | ls | kill NAME | state VALUE".into()),
+        _ => Err("usage: litemux [-S file] server | ls | kill NAME | state VALUE | hook EVENT".into()),
     }
 }
 
@@ -467,6 +510,17 @@ mod tests {
         assert!(matches!(parse(r#"{"op":"list","token":"abc"}"#, "abc"), Ok(Req::List)));
         assert_eq!(parse(r#"{"op":"list","token":"nope"}"#, "abc").err().as_deref(), Some("bad token"));
         assert_eq!(parse(r#"{"op":"list"}"#, "abc").err().as_deref(), Some("bad token"));
+    }
+
+    #[test]
+    fn turns_agent_hook_events_into_state_requests() {
+        let tool = json!({ "tool_name": "Edit", "tool_input": {} });
+        assert_eq!(hook_request("tool", &tool), Some(json!({ "op": "state", "value": "busy:Edit" })));
+        assert_eq!(hook_request("tool", &Value::Null), Some(json!({ "op": "state", "value": "busy" })));
+        let stop = json!({ "last_assistant_message": "Done." });
+        assert_eq!(hook_request("reply", &stop), Some(json!({ "op": "state", "value": "idle", "reply": "Done." })));
+        assert_eq!(hook_request("waiting", &stop), Some(json!({ "op": "state", "value": "waiting" })));
+        assert_eq!(hook_request("bogus", &Value::Null), None);
     }
 
     #[test]

@@ -19,7 +19,7 @@ cargo build --release
 cargo test
 ```
 
-The binary is `target/release/litemux`.
+The binary is `target/release/litemux`. Tagged versions (`v*`) publish prebuilt binaries for macOS, Linux and Windows on the releases page.
 
 ## Usage
 
@@ -30,7 +30,10 @@ litemux -S ~/litemux.json server     # run the server (it stays in the foregroun
 litemux -S ~/litemux.json ls         # name, pid, state and title of every session
 litemux -S ~/litemux.json kill NAME  # hang up a session
 litemux state busy                   # inside a session: set its state string
+litemux hook tool                    # agent hook: read the event JSON on stdin and set the state
 ```
+
+`hook EVENT` is meant for Claude Code and Codex hooks. Outside a session it does nothing and exits 0, so the same hook can stay installed for every agent. `tool` sets `busy:<tool_name>`, `reply` sets `idle` and keeps `last_assistant_message`, and `busy`, `idle` and `waiting` set that state.
 
 The server listens on a random port on `127.0.0.1`, then writes the port, a random 16-byte token and its pid to the server file, readable only by you. Every request must carry the token. A second server started with the same file exits if the first one still answers. The server exits and deletes the file when its last session ends.
 
@@ -49,9 +52,9 @@ A client opens a TCP connection and sends one JSON line. Every request includes 
 | Request | Reply |
 |---|---|
 | `{"op":"spawn","name","cwd","argv":[…],"env":{…},"cols","rows"}` | `{"ok":true}`; replaces a session with the same name |
-| `{"op":"list"}` | `{"ok":true,"sessions":[{"name","pid","title","state"}]}` |
+| `{"op":"list"}` | `{"ok":true,"sessions":[{"name","pid","title","state","reply","replyAt"}]}` |
 | `{"op":"kill","name"}` | `{"ok":true}` |
-| `{"op":"state","name","value"}` | `{"ok":true}` |
+| `{"op":"state","name","value","reply"?}` | `{"ok":true}`; `reply` also stores the agent's last message with a timestamp |
 | `{"op":"attach","name"}` | `{"ok":true}`, then the connection switches to frames |
 
 Errors come back as `{"ok":false,"error":"…"}` and the server closes the connection.
