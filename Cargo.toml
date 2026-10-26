@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["frozturk"]
 description = "Small terminal session server that keeps programs running between app restarts"
+license = "MIT"
 publish = false
 
 [dependencies]

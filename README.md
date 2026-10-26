@@ -70,3 +70,7 @@ The first `D` frame is a snapshot: a terminal reset, up to 5000 lines of scrollb
 Several clients can attach to one session. Output goes to all of them. Terminal query replies (cursor position, device attributes, colour reports) are only forwarded from the client that attached or typed most recently, so the program does not get duplicates. While no client is attached, the server answers cursor position, status and device attribute queries itself.
 
 The session title comes from the program's OSC 0/2 title sequences. The state is a free-form string that clients set with `state`; vide uses it for agent status from Claude Code and Codex hooks.
+
+## License
+
+MIT
